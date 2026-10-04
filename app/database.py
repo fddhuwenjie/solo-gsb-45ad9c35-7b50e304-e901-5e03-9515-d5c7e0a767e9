@@ -13,6 +13,7 @@ from .models import (
     CapabilityToken,
     ChainSubmission,
     IntegrityReport,
+    RedemptionEvent,
     RevocationEvent,
 )
 
@@ -51,6 +52,26 @@ CREATE TABLE IF NOT EXISTS revocations (
     UNIQUE (chain_id, token_id),
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
+
+-- 一次性访问核销：只在“末端 + 判定允许”时追加，成功后令牌不可再次核销。
+-- request_key 全局唯一（重放/冲突判定）；同一链内同一令牌至多成功核销一次。
+CREATE TABLE IF NOT EXISTS redemptions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id       TEXT NOT NULL,
+    token_id       TEXT NOT NULL,
+    request_key    TEXT NOT NULL UNIQUE,
+    request_path   TEXT NOT NULL,
+    method         TEXT NOT NULL,
+    source_ip      TEXT,
+    request_body   TEXT,
+    content_sha256 TEXT NOT NULL,
+    evaluated_at   TEXT NOT NULL,
+    redeemed_at    TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    result_json    TEXT NOT NULL,
+    UNIQUE (chain_id, token_id),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+);
 """
 
 DEMO_PRINCIPALS = {
@@ -65,9 +86,11 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or settings.db_path
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 并发写事务（BEGIN IMMEDIATE）锁竞争时等待而非立刻 SQLITE_BUSY
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -187,6 +210,7 @@ def load_chain_record(conn: sqlite3.Connection, chain_id: str) -> dict | None:
         "integrity": IntegrityReport.model_validate(json.loads(chain["report_json"])),
         "tokens": submission.tokens,
         "revocations": load_revocations(conn, chain_id),
+        "redemptions": load_redemptions(conn, chain_id),
     }
 
 
@@ -266,5 +290,93 @@ def _revocation_from_row(row: sqlite3.Row) -> RevocationEvent:
         reason=row["reason"],
         request_key=row["request_key"],
         content_sha256=row["content_sha256"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 一次性访问核销（只在允许且末端时追加，成功记录不可变）
+# --------------------------------------------------------------------------- #
+_REDEMPTION_COLUMNS = (
+    "chain_id, token_id, request_key, request_path, method, source_ip, "
+    "request_body, content_sha256, evaluated_at, redeemed_at, created_at"
+)
+
+
+def load_redemption_by_request_key(
+    conn: sqlite3.Connection, request_key: str
+) -> tuple[RedemptionEvent, str] | None:
+    """返回（核销事件, 首次响应 JSON）；未见过该 request_key 时返回 None。"""
+    row = conn.execute(
+        f"SELECT {_REDEMPTION_COLUMNS}, result_json FROM redemptions "
+        "WHERE request_key = ?",
+        (request_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _redemption_from_row(row), row["result_json"]
+
+
+def load_redemption_for_token(
+    conn: sqlite3.Connection, chain_id: str, token_id: str
+) -> RedemptionEvent | None:
+    """该令牌此前的成功核销记录（同一令牌只能成功核销一次）。"""
+    row = conn.execute(
+        f"SELECT {_REDEMPTION_COLUMNS}, result_json FROM redemptions "
+        "WHERE chain_id = ? AND token_id = ?",
+        (chain_id, token_id),
+    ).fetchone()
+    return _redemption_from_row(row) if row else None
+
+
+def load_redemptions(
+    conn: sqlite3.Connection, chain_id: str
+) -> list[RedemptionEvent]:
+    """按追加顺序（id 升序）返回某条链的全部成功核销记录。"""
+    rows = conn.execute(
+        f"SELECT {_REDEMPTION_COLUMNS} FROM redemptions "
+        "WHERE chain_id = ? ORDER BY id",
+        (chain_id,),
+    ).fetchall()
+    return [_redemption_from_row(r) for r in rows]
+
+
+def insert_redemption(
+    conn: sqlite3.Connection, event: RedemptionEvent, result_json: str
+) -> None:
+    """追加一条成功核销记录；唯一约束冲突时抛 sqlite3.IntegrityError。"""
+    conn.execute(
+        "INSERT INTO redemptions (chain_id, token_id, request_key, request_path, "
+        "method, source_ip, request_body, content_sha256, evaluated_at, redeemed_at, "
+        "created_at, result_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.chain_id,
+            event.token_id,
+            event.request_key,
+            event.request_path,
+            event.method,
+            event.source_ip,
+            json.dumps(event.request_body, ensure_ascii=False),
+            event.content_sha256,
+            event.evaluated_at.astimezone(timezone.utc).isoformat(),
+            event.redeemed_at.astimezone(timezone.utc).isoformat(),
+            event.created_at.astimezone(timezone.utc).isoformat(),
+            result_json,
+        ),
+    )
+
+
+def _redemption_from_row(row: sqlite3.Row) -> RedemptionEvent:
+    return RedemptionEvent(
+        chain_id=row["chain_id"],
+        token_id=row["token_id"],
+        request_key=row["request_key"],
+        request_path=row["request_path"],
+        method=row["method"],
+        source_ip=row["source_ip"],
+        request_body=json.loads(row["request_body"]),
+        content_sha256=row["content_sha256"],
+        evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+        redeemed_at=datetime.fromisoformat(row["redeemed_at"]),
         created_at=datetime.fromisoformat(row["created_at"]),
     )

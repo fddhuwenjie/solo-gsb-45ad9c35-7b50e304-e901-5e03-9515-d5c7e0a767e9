@@ -9,10 +9,14 @@
 4. **逐级收窄** —— 子令牌的路径模式、HTTP 方法集合、时间窗、`allow_ip` CIDR 只能比父令牌更窄；
 5. **请求级判定** —— 给定请求路径、方法、时间、来源 IP 与请求主体，返回 `allow` / `deny`、首个失败节点和完整验证轨迹；
 6. **按时间生效的撤销审计** —— 运维方可对链上任一令牌追加**不可变撤销事件**（含生效时间、原因、幂等键），
-   求值按请求时间解释事件：生效后该节点及其后代一律拒绝，生效前的历史请求仍按原链判定。
+   求值按请求时间解释事件：生效后该节点及其后代一律拒绝，生效前的历史请求仍按原链判定；
+7. **一次性访问核销** —— 对已提交链的**末端令牌**执行一次性核销：以服务端接收时刻重算全部判定，
+   仅在末端且允许时记录核销；同一令牌只能成功核销一次（并发仅一笔成功），
+   `request_key` 成功重放返回首次结果（即使令牌随后过期 / 被撤销），换内容冲突；
+   判定拒绝与目标不符均不核销、不占用 `request_key`。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
-撤销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
+撤销与核销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
 
 技术栈：Python · FastAPI · Pydantic v2 · SQLite（标准库 `sqlite3`）· Uvicorn。
 
@@ -52,8 +56,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `alice`     | `demo-secret-alice`                     |
 
 用随仓库附带的脚本生成一条已签名的合法链（`root → service-a → service-b`）、
-提交、幂等重放、求值，再追加一条撤销并演示“生效后拒绝 / 生效前仍按原链判定”
-（需要本地 Python 3.10+）：
+提交、幂等重放、求值，对链末端执行一次性核销（含重放与重复核销冲突），
+再追加一条撤销并演示“生效后拒绝 / 生效前仍按原链判定”（需要本地 Python 3.10+）：
 
 ```bash
 # 只打印已签名的提交报文
@@ -109,6 +113,21 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 | `effective_at` | 是   | 撤销生效时间，必须携带时区；可指向未来（到期才解释） |
 | `reason`       | 是   | 撤销原因（审计说明，非空）                        |
 | `request_key`  | 是   | 客户端幂等键；同键内容必须一致，且**全局唯一**    |
+
+### 核销请求 `RedeemRequest`
+
+`POST /api/v1/chains/{chain_id}/redeem`（`chain_id` 取自 URL 路径）：
+
+| 字段           | 必填 | 说明                                              |
+| -------------- | ---- | ------------------------------------------------- |
+| `token_id`     | 是   | 被核销令牌；**必须为链末端**（唯一根→唯一子链的最后一个令牌） |
+| `request_key`  | 是   | 客户端幂等键；同键内容必须一致，且**全局唯一**（仅成功核销占用） |
+| `request_path` | 是   | 实际请求路径                                      |
+| `method`       | 是   | 实际 HTTP 方法（大小写不敏感）                    |
+| `source_ip`    | 否   | 链上任一令牌含 `allow_ip` 时需要提供              |
+| `body`         | 否   | 任意 JSON；服务只记录 SHA-256 指纹到轨迹，正文随核销记录留档 |
+
+> 核销请求**不提供时间**：判定时间固定为服务端接收该请求的时刻（UTC）。
 
 ---
 
@@ -174,7 +193,8 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 ### `GET /api/v1/chains/{chain_id}`
 
 返回存储的链：令牌列表、内容哈希、创建时间、提交时的完整性报告，以及按追加顺序排列的
-**撤销事件列表** `revocations`（从未撤销时为 `[]`）；不存在返回 `404`。
+**撤销事件列表** `revocations` 与**成功核销记录列表** `redemptions`（从未发生时均为 `[]`）；
+不存在返回 `404`。
 
 ```json
 {
@@ -192,6 +212,21 @@ PYTHONPATH=. python scripts/demo_chain.py submit
       "request_key": "ops-revoke-2026-0001",
       "content_sha256": "…",
       "created_at": "2026-10-01T09:30:00+00:00"
+    }
+  ],
+  "redemptions": [
+    {
+      "chain_id": "demo-chain-0001",
+      "token_id": "token-b",
+      "request_key": "access-redeem-2026-0001",
+      "request_path": "/files/reports/2026/q1.pdf",
+      "method": "GET",
+      "source_ip": "10.1.2.3",
+      "request_body": { "q": "demo" },
+      "content_sha256": "…",
+      "evaluated_at": "2026-10-01T09:00:00+00:00",
+      "redeemed_at": "2026-10-01T09:00:00+00:00",
+      "created_at": "2026-10-01T09:00:00+00:00"
     }
   ]
 }
@@ -286,6 +321,74 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/revocations
 
 ---
 
+## 一次性访问核销 `POST /api/v1/chains/{chain_id}/redeem`
+
+对已提交链的**末端令牌**做一次性（exactly-once）访问核销。整个流程在
+**同一 SQLite 事务**（`BEGIN IMMEDIATE`，写锁串行化）内完成：
+
+1. 以**服务端接收时刻**（UTC，响应中的 `evaluated_at`）重算现有验签、逐级收窄、
+   按时间解释的撤销状态，以及路径 / 方法 / 时间窗 / 来源 IP 的请求级判定（复用只读求值的同一引擎）；
+2. 仅当目标确为**链末端**且判定为 `allow` 时才追加一条不可变核销记录（`redeemed_at`）；
+3. 同一令牌**只能成功核销一次**：并发请求仅一笔 `201`，其余均得到明确的
+   `409`（含赢家的 `existing_request_key` 与 `redeemed_at`）；
+4. 成功核销后，同一 `request_key` 带**相同内容**重试，返回**首次结果**
+   （`200`、`replayed=true`、首次的轨迹与 `redeemed_at`），即使令牌随后过期或被撤销；
+   同键换内容（换目标令牌 / 路径 / 方法 / IP / 请求体）返回 `409`；
+5. 目标不是链末端，或判定为 `deny` 时，**既不核销，也不占用 `request_key`**——
+   后续有效请求仍可尝试，同一 `request_key` 也还能用于一次成功核销。
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "token_id": "token-b",
+    "request_key": "access-redeem-2026-0001",
+    "request_path": "/files/reports/2026/q1.pdf",
+    "method": "GET",
+    "source_ip": "10.1.2.3",
+    "body": {"q": "demo"}
+  }'
+```
+
+成功核销（`201 Created`）响应：
+
+```json
+{
+  "chain_id": "demo-chain-0001",
+  "token_id": "token-b",
+  "request_key": "access-redeem-2026-0001",
+  "redeemed": true,
+  "replayed": false,
+  "evaluated_at": "2026-10-04T09:00:00.000000Z",
+  "redeemed_at": "2026-10-04T09:00:00.000000Z",
+  "decision": "allow",
+  "first_failed_node": null,
+  "first_failed_reason": null,
+  "body_sha256": "…",
+  "first_revoked_node": null,
+  "trace": [ /* 与 /evaluate 同构的完整判定轨迹：完整性 + 请求级 */ ]
+}
+```
+
+状态码与重放语义：
+
+| 情况 | 状态码 | 响应要点 |
+| ---- | ------ | -------- |
+| 首次且末端 + 允许 | `201` | `redeemed=true`、`replayed=false`，记录核销 |
+| 同 `request_key` 同内容重试 | `200` | `replayed=true`，回放首次结果（令牌事后过期 / 撤销也不变） |
+| 末端但本次判定拒绝 | `200` | `redeemed=false`、`decision="deny"`、完整轨迹；不核销、不占键 |
+| 同 `request_key` 换内容 | `409` | 给出双方 `existing_sha256` / `received_sha256` |
+| 目标非链末端 | `409` | 附 `chain_tip_token_id`（结构异常无法确定时为 `null`） |
+| 令牌此前已核销（含并发输家） | `409` | 附 `existing_request_key` 与赢家 `redeemed_at` |
+| 链 / 令牌不存在 | `404` | 令牌不属于该链按不存在处理 |
+| 输入非法（方法 / IP） | `422` | Pydantic 校验错误 |
+
+> 核销是**只追加**的成功记录：数据库以 `request_key UNIQUE` 与
+> `(chain_id, token_id) UNIQUE` 双重约束兜底并发；被拒绝 / 目标不符的尝试不落任何记录。
+> 核销不影响原有只读 `/evaluate`：后者仍每次实时重算，令牌被核销后照常可按时间判定为 allow/deny。
+
+---
+
 ## 规范化 JSON 与签名（重要）
 
 签名覆盖除 `signature` 外的下列字段（固定集合、固定键顺序无关，因为规范化时按键排序）：
@@ -372,14 +475,14 @@ token["signature"] = compute_signature(token, issuer_secret)
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值
+│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销/一次性核销
 │   ├── models.py      # Pydantic 模型与输入校验
-│   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语
-│   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎与轨迹
-│   ├── database.py    # SQLite 初始化、主体与链持久化
+│   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语、内容指纹
+│   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎、链末端识别与轨迹
+│   ├── database.py    # SQLite 初始化、主体/链/撤销/核销持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：55 个用例（含端到端 API、原语单测与撤销审计）
+├── tests/             # pytest：82 个用例（端到端 API、原语单测、撤销审计、一次性核销）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

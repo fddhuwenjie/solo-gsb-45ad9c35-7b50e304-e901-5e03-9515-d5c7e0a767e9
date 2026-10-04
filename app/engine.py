@@ -420,6 +420,35 @@ def compute_revocation_effects(
     return {tid: active[_earliest_origin(tid)] for tid in origins}
 
 
+def chain_tip_token(submission: ChainSubmission) -> CapabilityToken | None:
+    """结构意义上的链末端：从唯一根出发沿唯一子链可达的最后一个令牌。
+
+    与 :func:`validate_chain` 的选路一致（首个子令牌优先、环保护）；
+    无根 / 断链 / 分叉等无法确定唯一末端时返回 ``None``。
+    """
+    unique: dict[str, CapabilityToken] = {}
+    for t in submission.tokens:
+        unique.setdefault(t.token_id, t)
+
+    roots = [t for t in unique.values() if t.parent_id is None]
+    if len(roots) != 1:
+        return None
+    children: dict[str, list[CapabilityToken]] = defaultdict(list)
+    for t in unique.values():
+        if t.parent_id is not None and t.parent_id in unique:
+            children[t.parent_id].append(t)
+
+    cur = roots[0]
+    guard: set[str] = set()
+    while cur.token_id not in guard:
+        guard.add(cur.token_id)
+        kids = children.get(cur.token_id, [])
+        if len(kids) != 1:
+            return cur if not kids else None
+        cur = kids[0]
+    return None  # 结构成环，无末端
+
+
 def affected_token_ids(
     submission: ChainSubmission,
     trace_order: list[str],

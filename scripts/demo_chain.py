@@ -29,6 +29,8 @@ SECRETS = {
 }
 
 CHAIN_ID = os.getenv("DEMO_CHAIN_ID", "demo-chain-0001")
+# 演示一次性核销：核销末端 token-b（必须在撤销之前，撤销后将判定拒绝）
+REDEEM_REQUEST_KEY = os.getenv("DEMO_REDEEM_KEY", "access-redeem-2026-0001")
 # 演示撤销：撤销 token-a，使其及后代 token-b 自该时刻起失效
 REVOKE_TOKEN_ID = "token-a"
 REVOKE_REQUEST_KEY = os.getenv("DEMO_REVOKE_KEY", "ops-revoke-2026-0001")
@@ -96,7 +98,7 @@ def build_submission() -> dict:
         "service-b-worker",
         "/files/reports/2026/q1.pdf",
         ["GET"],
-        nb + timedelta(days=1),
+        nb + timedelta(hours=2),
         na - timedelta(days=2),
         "10.1.0.0/16",
     )
@@ -122,6 +124,13 @@ def build_revocation(effective_at: datetime | None = None) -> dict:
         "reason": REVOKE_REASON,
         "request_key": REVOKE_REQUEST_KEY,
     }
+
+
+def build_redemption() -> dict:
+    """一次性核销请求：目标为链末端 token-b；判定时间由服务端取接收时刻。"""
+    eval_request = build_evaluation()
+    eval_request.pop("at", None)  # 核销接口不接受客户端时间
+    return {"token_id": "token-b", "request_key": REDEEM_REQUEST_KEY, **eval_request}
 
 
 def _post(url: str, payload: dict) -> tuple[int, dict]:
@@ -162,6 +171,27 @@ def main() -> int:
     )
     print(f"[evaluate-before-revocation] HTTP {status_code}")
     print(json.dumps(body, ensure_ascii=False, indent=2))
+
+    # 一次性访问核销：对链末端 token-b 成功核销（201，返回判定轨迹与核销时间）
+    redemption = build_redemption()
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem", redemption
+    )
+    print(f"[redeem] HTTP {status_code}")
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+
+    # 同 request_key 同内容重放：返回首次结果（200，replayed=true）
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem", redemption
+    )
+    print(f"[redeem-replay] HTTP {status_code} (replayed={body.get('replayed')})")
+
+    # 再次尝试核销同一令牌（换 request_key）：409，明确报告已核销
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem",
+        {**redemption, "request_key": "access-redeem-2026-0002"},
+    )
+    print(f"[redeem-again] HTTP {status_code} {body.get('detail', body)}")
 
     # 提交按时间生效的撤销（effective_at 取“现在”，立即生效）
     effective = datetime.now(timezone.utc)
