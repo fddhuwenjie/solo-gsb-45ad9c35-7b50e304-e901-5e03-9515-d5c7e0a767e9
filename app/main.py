@@ -1,6 +1,7 @@
-"""FastAPI 应用：提交能力链、幂等重放、冲突检测、撤销审计与请求级判定。"""
+"""FastAPI 应用：提交能力链、幂等重放、冲突检测、撤销审计、请求级判定与一次性核销。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -13,8 +14,11 @@ from .database import (
     get_db,
     get_secret,
     init_db,
+    insert_redemption,
     insert_revocation,
     load_chain_record,
+    load_redemption_by_request_key,
+    load_redemption_for_token,
     load_revocation_by_request_key,
     load_revocation_for_token,
     load_revocations,
@@ -23,7 +27,12 @@ from .database import (
     token_exists,
     upsert_principal,
 )
-from .engine import affected_token_ids, evaluate_request, validate_chain
+from .engine import (
+    affected_token_ids,
+    chain_tip_token_id,
+    evaluate_request,
+    validate_chain,
+)
 from .models import (
     ChainRecord,
     ChainSubmission,
@@ -32,12 +41,19 @@ from .models import (
     EvaluateResult,
     PrincipalIn,
     PrincipalOut,
+    RedemptionRecord,
+    RedemptionRequest,
+    RedemptionResult,
     RevocationEvent,
     RevocationRequest,
     RevocationResult,
     SubmissionResult,
 )
-from .security import canonical_revocation_hash, canonical_submission_hash
+from .security import (
+    canonical_redemption_hash,
+    canonical_revocation_hash,
+    canonical_submission_hash,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -51,9 +67,9 @@ app = FastAPI(
     description=(
         "客户端提交根授权和以 parent_id 相连的委托令牌；服务验签、检测断链与环，"
         "并强制路径 / 方法 / 时间窗 / IP 网段只能逐级收窄。"
-        "支持按时间生效的不可变撤销事件及其请求级求值。"
+        "支持按时间生效的不可变撤销事件、请求级求值，以及链末端令牌的一次性访问核销。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -168,6 +184,220 @@ def evaluate_chain(
     revocations = load_revocations(conn, chain_id)
     return evaluate_request(
         submission, payload, _secret_lookup(conn), revocations=revocations
+    )
+
+
+@app.post(
+    "/api/v1/chains/{chain_id}/redeem",
+    response_model=RedemptionResult,
+)
+def redeem_chain_tip(
+    chain_id: str,
+    payload: RedemptionRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> JSONResponse:
+    """对链末端令牌执行一次性访问核销。
+
+    服务器以接收时的服务器时间（UTC）作为判定时间，在**同一 SQLite 事务**内
+    实时重算验签 / 逐级收窄 / 请求级判定与撤销状态，仅当：
+
+    - 目标 ``token_id`` 确为该链结构上的链末端；且
+    - 整条链实时判定为 ``allow``
+
+    才记录核销（每个令牌仅一次）。规则：
+
+    - 同 ``request_key`` 同内容：幂等返回首次结果（``200``，``replayed=true``），
+      即使令牌随后过期或被撤销；同键换内容：``409``；
+    - 令牌已被核销（含并发落败者）：``409``，明确报告已核销；
+    - 目标不是链末端或判定拒绝：``200``，``redeemed=false``，不核销也不占用
+      ``request_key``，后续有效请求仍可尝试；
+    - 链不存在：``404``；令牌不属于该链：``404``。
+    """
+    content_hash = canonical_redemption_hash(
+        chain_id,
+        payload.token_id,
+        payload.request_key,
+        payload.request_path,
+        payload.method,
+        payload.source_ip,
+        payload.body,
+    )
+
+    # 立即获取写锁，把“检查 + 核销”串成临界区，保证并发下仅一笔成功
+    conn.execute("BEGIN IMMEDIATE")
+
+    # 1) request_key 幂等 / 冲突（成功核销记录中存在即占键）
+    existing_key = load_redemption_by_request_key(conn, payload.request_key)
+    if existing_key is not None:
+        if existing_key.content_sha256 == content_hash:
+            stored = json.loads(existing_key.result_json)
+            stored["replayed"] = True
+            return JSONResponse(status_code=status.HTTP_200_OK, content=stored)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": (
+                    f"request_key={payload.request_key!r} 已用于另一次成功核销，"
+                    "同一 request_key 不得更换内容或目标"
+                ),
+                "request_key": payload.request_key,
+                "existing_sha256": existing_key.content_sha256,
+                "received_sha256": content_hash,
+            },
+        )
+
+    # 2) 链必须存在
+    submission = load_submission(conn, chain_id)
+    if submission is None:
+        raise HTTPException(
+            status_code=404, detail=f"chain_id {chain_id!r} 不存在"
+        )
+
+    # 3) 目标令牌必须属于该链
+    if not token_exists(conn, chain_id, payload.token_id):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"chain_id {chain_id!r} 中不存在 token_id={payload.token_id!r}"
+            ),
+        )
+
+    # 3.5) 令牌此前已成功核销（含并发落败）：明确报告已核销。
+    # 注意：同 request_key 同内容的重放已在第 1 步短路，即使令牌随后过期或被撤销
+    # 仍返回首次结果；走到这里必然是“换键再次核销”，一律 409。
+    existing_token = load_redemption_for_token(conn, chain_id, payload.token_id)
+    if existing_token is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": (
+                    f"token_id={payload.token_id!r} 已在 request_key="
+                    f"{existing_token.request_key!r} 中成功核销，"
+                    "同一令牌只能核销一次"
+                ),
+                "chain_id": chain_id,
+                "token_id": payload.token_id,
+                "existing_request_key": existing_token.request_key,
+                "redeemed_at": existing_token.redeemed_at.isoformat(),
+            },
+        )
+
+    # 4) 以接收时的服务器时间实时重算完整判定（含历史撤销解释）
+    now = datetime.now(timezone.utc)
+    evaluation = evaluate_request(
+        submission,
+        EvaluateRequest(
+            request_path=payload.request_path,
+            method=payload.method,
+            at=now,
+            source_ip=payload.source_ip,
+            body=payload.body,
+        ),
+        _secret_lookup(conn),
+        revocations=load_revocations(conn, chain_id),
+    )
+
+    tip = chain_tip_token_id(submission)
+    if tip is None or payload.token_id != tip:
+        result = RedemptionResult(
+            chain_id=chain_id,
+            token_id=payload.token_id,
+            request_key=payload.request_key,
+            redeemed=False,
+            replayed=False,
+            decision=evaluation.decision,
+            not_redeemed_reason="target_not_chain_tip",
+            evaluated_at=now,
+            redeemed_at=None,
+            content_sha256=content_hash,
+            evaluation=evaluation,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=result.model_dump(mode="json"),
+        )
+
+    if evaluation.decision != "allow":
+        result = RedemptionResult(
+            chain_id=chain_id,
+            token_id=payload.token_id,
+            request_key=payload.request_key,
+            redeemed=False,
+            replayed=False,
+            decision="deny",
+            not_redeemed_reason="decision_denied",
+            evaluated_at=now,
+            redeemed_at=None,
+            content_sha256=content_hash,
+            evaluation=evaluation,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=result.model_dump(mode="json"),
+        )
+
+    result = RedemptionResult(
+        chain_id=chain_id,
+        token_id=payload.token_id,
+        request_key=payload.request_key,
+        redeemed=True,
+        replayed=False,
+        decision="allow",
+        not_redeemed_reason=None,
+        evaluated_at=now,
+        redeemed_at=now,
+        content_sha256=content_hash,
+        evaluation=evaluation,
+    )
+    result_json = json.dumps(result.model_dump(mode="json"), ensure_ascii=False)
+    record = RedemptionRecord(
+        chain_id=chain_id,
+        token_id=payload.token_id,
+        request_key=payload.request_key,
+        content_sha256=content_hash,
+        evaluated_at=now,
+        redeemed_at=now,
+        result_json=result_json,
+    )
+    try:
+        insert_redemption(conn, record)
+    except sqlite3.IntegrityError:
+        # 并发兜底：request_key 抢占（理论上前置检查已覆盖）或令牌已被他笔核销
+        existing_token = load_redemption_for_token(
+            conn, chain_id, payload.token_id
+        )
+        if existing_token is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "detail": (
+                        f"token_id={payload.token_id!r} 已在 request_key="
+                        f"{existing_token.request_key!r} 中成功核销，"
+                        "同一令牌只能核销一次"
+                    ),
+                    "chain_id": chain_id,
+                    "token_id": payload.token_id,
+                    "existing_request_key": existing_token.request_key,
+                    "redeemed_at": existing_token.redeemed_at.isoformat(),
+                },
+            )
+        existing_key = load_redemption_by_request_key(conn, payload.request_key)
+        assert existing_key is not None
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": (
+                    f"request_key={payload.request_key!r} 已被并发请求占用"
+                ),
+                "request_key": payload.request_key,
+                "existing_sha256": existing_key.content_sha256,
+                "received_sha256": content_hash,
+            },
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content=result.model_dump(mode="json"),
     )
 
 

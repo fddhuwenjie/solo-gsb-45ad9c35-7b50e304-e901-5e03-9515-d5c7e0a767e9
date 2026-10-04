@@ -264,6 +264,89 @@ class RevocationResult(BaseModel):
     affected_token_ids: list[str]
 
 
+# --------------------------------------------------------------------------- #
+# 一次性访问核销
+# --------------------------------------------------------------------------- #
+class RedemptionRequest(BaseModel):
+    """对链末端令牌的一次性访问核销请求（chain_id 取自 URL 路径）。
+
+    服务器以**接收时的服务器时间**作为判定时间，调用方不提供时间字段。
+    """
+
+    token_id: str = Field(min_length=1, description="声称的链末端（叶）令牌 id")
+    request_key: str = Field(
+        min_length=1, description="客户端幂等键；同键内容必须一致，且全局唯一"
+    )
+    request_path: str = Field(description="实际请求路径")
+    method: str = Field(description="实际 HTTP 方法（大小写不敏感）")
+    source_ip: str | None = Field(
+        default=None, description="来源 IP；链上任一令牌含 allow_ip 时必填"
+    )
+    body: Any = Field(
+        default=None, description="请求主体，仅记录 SHA-256 指纹到判定轨迹"
+    )
+
+    @field_validator("request_path")
+    @classmethod
+    def _validate_request_path(cls, v: str) -> str:
+        if not _PATH_RE.match(v):
+            raise ValueError("request_path 必须以 / 开头且不能包含空白字符")
+        return v
+
+    @field_validator("method")
+    @classmethod
+    def _validate_method(cls, v: str) -> str:
+        if not _METHOD_RE.match(v):
+            raise ValueError(f"非法 HTTP 方法: {v!r}")
+        return v.upper()
+
+    @field_validator("source_ip")
+    @classmethod
+    def _validate_source_ip(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        from ipaddress import ip_address
+
+        try:
+            return str(ip_address(v))
+        except ValueError as exc:
+            raise ValueError(f"source_ip 不是合法 IP: {exc}") from exc
+
+
+class RedemptionResult(BaseModel):
+    """一次性核销的判定结果；重放时原样返回首次结果（仅 replayed 翻为 true）。"""
+
+    chain_id: str
+    token_id: str
+    request_key: str
+    # 是否实际发生了（首次）核销
+    redeemed: bool
+    # 是否为同一 request_key 成功核销的幂等重放
+    replayed: bool
+    decision: Literal["allow", "deny"]
+    # redeemed=false 时的解释：判定拒绝 / 目标不是链末端；成功或重放时为 null
+    not_redeemed_reason: Literal["decision_denied", "target_not_chain_tip"] | None
+    # 接收请求时的服务器时间（判定所用时间）
+    evaluated_at: datetime
+    # 首次成功核销时间；未核销时为 null
+    redeemed_at: datetime | None
+    content_sha256: str = Field(
+        description="核销请求规范化内容指纹，用于重放/冲突判定"
+    )
+    evaluation: "EvaluateResult"
+
+
+class RedemptionRecord(BaseModel):
+    """成功核销的持久化记录（只追加）；完整首响应急在 result_json 中。"""
+
+    chain_id: str
+    token_id: str
+    request_key: str
+    content_sha256: str
+    evaluated_at: datetime
+    redeemed_at: datetime
+    result_json: str
+
 
 class PrincipalIn(BaseModel):
     name: str = Field(min_length=1)

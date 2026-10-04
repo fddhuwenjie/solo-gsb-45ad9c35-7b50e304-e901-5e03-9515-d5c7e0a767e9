@@ -353,6 +353,45 @@ def _first_failure(traces: list[NodeTrace]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def chain_tip_token_id(submission: ChainSubmission) -> str | None:
+    """返回结构合法（单根、无重复、无断链、无分叉、无环、全可达）线性链的末端 id。
+
+    任一结构性质不满足则返回 ``None``。能力链是单根单子的线性委托序列，
+    “链末端”即沿 parent_id 从根下行的最后一个令牌（没有任何子令牌引用它）。
+    """
+    unique: dict[str, CapabilityToken] = {}
+    for t in submission.tokens:
+        if t.token_id in unique:
+            return None  # 重复 id
+        unique[t.token_id] = t
+
+    roots = [t for t in unique.values() if t.parent_id is None]
+    if len(roots) != 1:
+        return None  # 无根或多根
+
+    child_count: dict[str, int] = defaultdict(int)
+    for t in unique.values():
+        if t.parent_id is not None:
+            if t.parent_id not in unique:
+                return None  # 断链
+            child_count[t.parent_id] += 1
+    if any(n > 1 for n in child_count.values()):
+        return None  # 分叉
+
+    # 从唯一根出发沿唯一子下行；环保护；最终必须遍历全部节点
+    order: list[str] = []
+    cur: str | None = roots[0].token_id
+    while cur is not None:
+        if cur in order:
+            return None  # 环
+        order.append(cur)
+        kids = [tid for tid, tok in unique.items() if tok.parent_id == cur]
+        cur = kids[0] if kids else None
+    if len(order) != len(unique):
+        return None  # 存在与根不可达的孤点
+    return order[-1]
+
+
 # --------------------------------------------------------------------------- #
 # 撤销：按求值时间解释事件，计算受影响节点
 # --------------------------------------------------------------------------- #

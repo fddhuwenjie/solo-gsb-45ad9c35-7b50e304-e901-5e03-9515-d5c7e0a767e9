@@ -9,10 +9,14 @@
 4. **逐级收窄** —— 子令牌的路径模式、HTTP 方法集合、时间窗、`allow_ip` CIDR 只能比父令牌更窄；
 5. **请求级判定** —— 给定请求路径、方法、时间、来源 IP 与请求主体，返回 `allow` / `deny`、首个失败节点和完整验证轨迹；
 6. **按时间生效的撤销审计** —— 运维方可对链上任一令牌追加**不可变撤销事件**（含生效时间、原因、幂等键），
-   求值按请求时间解释事件：生效后该节点及其后代一律拒绝，生效前的历史请求仍按原链判定。
+   求值按请求时间解释事件：生效后该节点及其后代一律拒绝，生效前的历史请求仍按原链判定；
+7. **链末端一次性访问核销** —— 调用方对**链末端令牌**发起带 `request_key` 的核销请求；
+   服务以接收时的服务器时间在同一 SQLite 事务内实时重算验签、收窄、请求级判定与撤销状态，
+   仅当目标确为链末端且判定 `allow` 时记录核销。同一令牌只能成功核销一次（并发下仅一笔成功），
+   同 `request_key` 同内容重放永远返回首次结果（即使令牌随后过期或被撤销）。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
-撤销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
+撤销与核销均按各自的 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
 
 技术栈：Python · FastAPI · Pydantic v2 · SQLite（标准库 `sqlite3`）· Uvicorn。
 
@@ -109,6 +113,21 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 | `effective_at` | 是   | 撤销生效时间，必须携带时区；可指向未来（到期才解释） |
 | `reason`       | 是   | 撤销原因（审计说明，非空）                        |
 | `request_key`  | 是   | 客户端幂等键；同键内容必须一致，且**全局唯一**    |
+
+### 核销请求 `RedemptionRequest`
+
+`POST /api/v1/chains/{chain_id}/redeem`（`chain_id` 取自 URL 路径）：
+
+| 字段           | 必填 | 说明                                                         |
+| -------------- | ---- | ------------------------------------------------------------ |
+| `token_id`     | 是   | 声称的链末端（叶）令牌；必须已存在于该链                     |
+| `request_key`  | 是   | 客户端幂等键；同键内容必须一致，且**全局唯一**（与撤销事件的键空间独立） |
+| `request_path` | 是   | 实际请求路径，以 `/` 开头                                    |
+| `method`       | 是   | 实际 HTTP 方法（大小写不敏感，规范化为大写）                 |
+| `source_ip`    | 否   | 来源 IP；链上任一令牌含 `allow_ip` 时必填                    |
+| `body`         | 否   | 任意 JSON；不据其授权，只记录 SHA-256 指纹到判定轨迹         |
+
+> 判定时间由**服务端接收请求时的服务器时间（UTC）**决定，请求体中没有也不接受时间字段。
 
 ---
 
@@ -284,6 +303,74 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/revocations
 求值必须**整条链所有节点**全部通过才为 `allow`；`first_failed_node` /
 `first_failed_reason` 指向按链顺序（根→叶，先完整性后请求级）遇到的第一个失败。
 
+### `POST /api/v1/chains/{chain_id}/redeem`
+
+对已存链的**末端令牌**执行一次性访问核销。服务端在**同一 SQLite 事务**内
+（`BEGIN IMMEDIATE` 抢占写锁）完成“取服务器时间 → 实时重算完整判定 → 记录核销”，
+因此并发请求恰好一笔成功：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "token_id": "token-b",
+    "request_key": "client-access-2026-1004-0001",
+    "request_path": "/files/reports/2026/q1.pdf",
+    "method": "GET",
+    "source_ip": "10.1.2.3",
+    "body": { "note": "核销演示" }
+  }'
+```
+
+成功核销返回 `201 Created`：
+
+```json
+{
+  "chain_id": "demo-chain-0001",
+  "token_id": "token-b",
+  "request_key": "client-access-2026-1004-0001",
+  "redeemed": true,
+  "replayed": false,
+  "decision": "allow",
+  "not_redeemed_reason": null,
+  "evaluated_at": "2026-10-04T15:41:32.214284+00:00",
+  "redeemed_at": "2026-10-04T15:41:32.214284+00:00",
+  "content_sha256": "…",
+  "evaluation": {
+    "chain_id": "demo-chain-0001",
+    "decision": "allow",
+    "first_failed_node": null,
+    "first_failed_reason": null,
+    "first_revoked_node": null,
+    "body_sha256": "…",
+    "trace": [ /* 与 /evaluate 完全一致的完整判定轨迹 */ ]
+  }
+}
+```
+
+行为约定：
+
+- **幂等重放（`200 OK`，`replayed=true`）**：相同 `request_key` 且内容逐字节等价
+  （规范化 SHA-256 相同）时，**原样返回首次结果**——包括首次的 `evaluated_at`、
+  `redeemed_at` 与判定轨迹；即使令牌**随后过期或被撤销**，重放仍是首次的 `allow`；
+- **同键换内容（`409 Conflict`）**：同一 `request_key` 更换目标令牌、路径、方法、
+  来源 IP 或请求体（指纹不同）均冲突，响应给出双方哈希；
+- **重复核销（`409 Conflict`）**：令牌已被成功核销后，以**任何其他 `request_key`**
+  再来一律拒绝，响应明确报告“已核销”并附首次的 `request_key` 与 `redeemed_at`；
+- **目标不符（`200 OK`，`redeemed=false`）**：`token_id` 存在于该链但不是链末端
+  （叶令牌）时，`not_redeemed_reason="target_not_chain_tip"`。**不核销，也不占用
+  `request_key`**——同一键随后指向末端的有效请求仍可成功；
+- **判定拒绝（`200 OK`，`redeemed=false`）**：实时判定为 `deny`（方法 / 路径 / IP /
+  时间窗 / 验签 / 撤销等任何一项失败）时，`not_redeemed_reason="decision_denied"`，
+  `evaluation` 给出完整轨迹与首个失败节点。同样**不核销、不占键**，修正请求后用同一
+  `request_key` 重试即可成功；
+- **`404 Not Found`**：链不存在，或 `token_id` 不属于该链；
+- **`422`**：路径不以 `/` 开头、非法方法 / IP 等输入校验失败。
+
+核销只在成功时落库（表 `redemptions`，`request_key UNIQUE` 与
+`(chain_id, token_id) UNIQUE` 双重约束兜底并发）；它不是撤销，不影响
+`POST /evaluate` 的只读判定与既有撤销语义。只读求值接口和历史撤销行为保持不变。
+
 ---
 
 ## 规范化 JSON 与签名（重要）
@@ -372,14 +459,14 @@ token["signature"] = compute_signature(token, issuer_secret)
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值
+│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销/一次性核销
 │   ├── models.py      # Pydantic 模型与输入校验
-│   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语
-│   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎与轨迹
-│   ├── database.py    # SQLite 初始化、主体与链持久化
+│   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语、内容指纹
+│   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎、链末端判定与轨迹
+│   ├── database.py    # SQLite 初始化、主体、链、撤销事件与核销记录持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：55 个用例（含端到端 API、原语单测与撤销审计）
+├── tests/             # pytest：76 个用例（端到端 API、原语单测、撤销审计、一次性核销）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

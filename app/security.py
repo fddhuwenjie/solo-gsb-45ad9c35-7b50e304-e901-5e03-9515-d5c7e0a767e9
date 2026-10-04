@@ -112,6 +112,31 @@ def canonical_revocation_hash(
     return sha256_hex(canonical_json(payload).encode("utf-8"))
 
 
+def canonical_redemption_hash(
+    chain_id: str,
+    token_id: str,
+    request_key: str,
+    request_path: str,
+    method: str,
+    source_ip: str | None,
+    body: Any,
+) -> str:
+    """核销请求内容指纹：同一 request_key 的重放与换内容冲突均据此判定。
+
+    method 按模型层规范化后取大写；body 经规范化 JSON 归一化后参与哈希。
+    """
+    payload = {
+        "chain_id": chain_id,
+        "token_id": token_id,
+        "request_key": request_key,
+        "request_path": request_path,
+        "method": method,
+        "source_ip": source_ip,
+        "body": body,
+    }
+    return sha256_hex(canonical_json(payload).encode("utf-8"))
+
+
 # --------------------------------------------------------------------------- #
 # 路径 glob
 # --------------------------------------------------------------------------- #

@@ -13,6 +13,7 @@ from .models import (
     CapabilityToken,
     ChainSubmission,
     IntegrityReport,
+    RedemptionRecord,
     RevocationEvent,
 )
 
@@ -51,6 +52,22 @@ CREATE TABLE IF NOT EXISTS revocations (
     UNIQUE (chain_id, token_id),
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
+
+-- 一次性访问核销：只记录成功核销；未核销的拒绝 / 目标不符不落任何记录。
+-- request_key 与 revocations 命名空间独立但同样全局唯一；
+-- 同一链上同一令牌至多核销一次，DB 唯一约束兜底并发。
+CREATE TABLE IF NOT EXISTS redemptions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id       TEXT NOT NULL,
+    token_id       TEXT NOT NULL,
+    request_key    TEXT NOT NULL UNIQUE,
+    content_sha256 TEXT NOT NULL,
+    evaluated_at   TEXT NOT NULL,
+    redeemed_at    TEXT NOT NULL,
+    result_json    TEXT NOT NULL,
+    UNIQUE (chain_id, token_id),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+);
 """
 
 DEMO_PRINCIPALS = {
@@ -65,9 +82,14 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or settings.db_path
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # check_same_thread=False：FastAPI 依赖生成器可能在线程池的不同工作线程中
+    # 分别执行“取连接 / 关闭连接”（并发请求时尤甚）；连接本身为每请求独立、
+    # 不跨线程共享，写事务由 BEGIN IMMEDIATE 串行化，因此关闭线程亲和检查安全。
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 并发写（如核销的 BEGIN IMMEDIATE）排队等待写锁，而不是立刻 SQLITE_BUSY
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -267,4 +289,59 @@ def _revocation_from_row(row: sqlite3.Row) -> RevocationEvent:
         request_key=row["request_key"],
         content_sha256=row["content_sha256"],
         created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 一次性访问核销（只追加成功记录）
+# --------------------------------------------------------------------------- #
+def insert_redemption(conn: sqlite3.Connection, record: RedemptionRecord) -> None:
+    """追加一条成功核销；唯一约束冲突时抛出 sqlite3.IntegrityError（事务回滚）。"""
+    conn.execute(
+        "INSERT INTO redemptions (chain_id, token_id, request_key, content_sha256, "
+        "evaluated_at, redeemed_at, result_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            record.chain_id,
+            record.token_id,
+            record.request_key,
+            record.content_sha256,
+            record.evaluated_at.astimezone(timezone.utc).isoformat(),
+            record.redeemed_at.astimezone(timezone.utc).isoformat(),
+            record.result_json,
+        ),
+    )
+
+
+def load_redemption_by_request_key(
+    conn: sqlite3.Connection, request_key: str
+) -> RedemptionRecord | None:
+    row = conn.execute(
+        "SELECT chain_id, token_id, request_key, content_sha256, evaluated_at, "
+        "redeemed_at, result_json FROM redemptions WHERE request_key = ?",
+        (request_key,),
+    ).fetchone()
+    return _redemption_from_row(row) if row else None
+
+
+def load_redemption_for_token(
+    conn: sqlite3.Connection, chain_id: str, token_id: str
+) -> RedemptionRecord | None:
+    row = conn.execute(
+        "SELECT chain_id, token_id, request_key, content_sha256, evaluated_at, "
+        "redeemed_at, result_json FROM redemptions "
+        "WHERE chain_id = ? AND token_id = ?",
+        (chain_id, token_id),
+    ).fetchone()
+    return _redemption_from_row(row) if row else None
+
+
+def _redemption_from_row(row: sqlite3.Row) -> RedemptionRecord:
+    return RedemptionRecord(
+        chain_id=row["chain_id"],
+        token_id=row["token_id"],
+        request_key=row["request_key"],
+        content_sha256=row["content_sha256"],
+        evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+        redeemed_at=datetime.fromisoformat(row["redeemed_at"]),
+        result_json=row["result_json"],
     )

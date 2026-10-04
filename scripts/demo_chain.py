@@ -4,7 +4,7 @@
     # 仅打印已签名的提交报文（不依赖服务运行）
     python scripts/demo_chain.py print
 
-    # 提交到本机服务并执行一次求值（默认 http://127.0.0.1:8000）
+    # 提交到本机服务并执行一次求值与一次性核销（默认 http://127.0.0.1:8000）
     python scripts/demo_chain.py submit
     BASE_URL=http://localhost:8000 python scripts/demo_chain.py submit
 """
@@ -33,6 +33,9 @@ CHAIN_ID = os.getenv("DEMO_CHAIN_ID", "demo-chain-0001")
 REVOKE_TOKEN_ID = "token-a"
 REVOKE_REQUEST_KEY = os.getenv("DEMO_REVOKE_KEY", "ops-revoke-2026-0001")
 REVOKE_REASON = "运维安全事件：演示撤销 token-a 及其下游委托"
+# 演示一次性核销：目标必须是链末端 token-b
+REDEEM_TOKEN_ID = "token-b"
+REDEEM_REQUEST_KEY = os.getenv("DEMO_REDEEM_KEY", "client-access-2026-0001")
 
 
 def _token(
@@ -124,6 +127,18 @@ def build_revocation(effective_at: datetime | None = None) -> dict:
     }
 
 
+def build_redemption(*, request_key: str = REDEEM_REQUEST_KEY,
+                     method: str = "GET", body: dict | None = None) -> dict:
+    return {
+        "token_id": REDEEM_TOKEN_ID,
+        "request_key": request_key,
+        "request_path": "/files/reports/2026/q1.pdf",
+        "method": method,
+        "source_ip": "10.1.2.3",
+        "body": {"q": "demo"} if body is None else body,
+    }
+
+
 def _post(url: str, payload: dict) -> tuple[int, dict]:
     req = urllib.request.Request(
         url,
@@ -163,6 +178,46 @@ def main() -> int:
     print(f"[evaluate-before-revocation] HTTP {status_code}")
     print(json.dumps(body, ensure_ascii=False, indent=2))
 
+    # 一次性核销（在撤销前）：末端 token-b，服务器以接收时间判定
+    redemption = build_redemption()
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem", redemption
+    )
+    print(f"[redeem] HTTP {status_code} (redeemed={body.get('redeemed')})")
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+
+    # 同键同内容重放：返回首次结果（replayed=true），即使稍后撤销 / 令牌过期
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem", redemption
+    )
+    print(f"[redeem-replay] HTTP {status_code} (replayed={body.get('replayed')})")
+
+    # 同键换内容（改 body）：409 Conflict
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem",
+        build_redemption(body={"q": "tampered"}),
+    )
+    print(f"[redeem-same-key-diff-content] HTTP {status_code} (期望 409)")
+
+    # 换一个 request_key 再核销同一令牌：明确报告已核销（409）
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem",
+        build_redemption(request_key="client-access-2026-0002"),
+    )
+    print(f"[redeem-already-redeemed] HTTP {status_code} (期望 409)")
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+
+    # 目标不是链末端（token-a 是中间节点）：200 且 redeemed=false，不占键
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem",
+        {**build_redemption(request_key="client-access-non-tip"),
+         "token_id": "token-a"},
+    )
+    print(
+        f"[redeem-non-tip] HTTP {status_code} "
+        f"(redeemed={body.get('redeemed')}, reason={body.get('not_redeemed_reason')})"
+    )
+
     # 提交按时间生效的撤销（effective_at 取“现在”，立即生效）
     effective = datetime.now(timezone.utc)
     status_code, body = _post(
@@ -178,6 +233,15 @@ def main() -> int:
         build_revocation(effective),
     )
     print(f"[revoke-replay] HTTP {status_code} (replayed={body.get('replayed')})")
+
+    # 核销发生在撤销之前：同键重放仍返回首次 allow（事后撤销不影响首次结果）
+    status_code, body = _post(
+        f"{BASE_URL}/api/v1/chains/{CHAIN_ID}/redeem", redemption
+    )
+    print(
+        f"[redeem-replay-after-revocation] HTTP {status_code} "
+        f"(replayed={body.get('replayed')}, decision={body.get('decision')})"
+    )
 
     # 生效后的求值：token-a 及其后代 token-b 应被拒绝
     status_code, body = _post(
